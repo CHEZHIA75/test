@@ -1,23 +1,24 @@
 <#
-sa_password_rotate.ps1  
+tss_service_account_password_rotate.ps1  
 
-Rotates AD Service Account passwords using Secret Server Secret IDs.
+Rotate AD Service Account passwords using Secret Server Secret IDs.
 
 INPUT:
   -SecretIds "1234,5678"
 OPTIONS:
   -DryRun
-  -WordListPath ".\eff_wordlist"
+  -WordListPath "C:\tss_password_rotate\eff_wordlist"
 
-BEHAVIOUR:
-  - AD password is reset FIRST (source of truth)
-  - Secret Server password updated only if AD succeeds
-  - No secrets logged
-  - Script fails at end if any SecretId fails
+FLOW per SecretId:
+  1) Get secret from Secret Server
+  2) Read fields: "Username" and "Domain Name" (PaaS Service Account template)
+  3) Generate diceware-style password (>= 30 chars, trailing digit)
+  4) Reset AD password (Set-ADAccountPassword)
+  5) Update Secret Server password field
 
-Fields used:
-  - Username
-  - Domain Name
+NOTES:
+  - Never logs passwords
+  - Returns non-zero exit if any rotation fails
 #>
 
 [CmdletBinding()]
@@ -49,7 +50,7 @@ function Parse-SecretIds {
     param([string]$Value)
 
     $parts = $Value.Split(',') | ForEach-Object { $_.Trim() } | Where-Object { $_ }
-    if (-not $parts) { throw "No valid SecretIds provided." }
+    if (-not $parts -or $parts.Count -eq 0) { throw "No valid SecretIds provided." }
 
     $ids = New-Object System.Collections.Generic.List[int]
     $seen = @{}
@@ -90,27 +91,47 @@ function Load-WordList {
 }
 
 function Roll-DiceKey {
-    ($null = 1..4 | ForEach-Object { Get-Random -Minimum 1 -Maximum 7 })
-    return (1..4 | ForEach-Object { Get-Random -Minimum 1 -Maximum 7 }) -join ''
+    # 4 dice rolls -> 4 digits 1-6, e.g., 1436
+    $digits = @()
+    for ($i = 0; $i -lt 4; $i++) {
+        $digits += (Get-Random -Minimum 1 -Maximum 7)
+    }
+    return ($digits -join '')
 }
 
 function New-DicewarePassword {
     param(
-        [hashtable]$WordMap,
+        [Parameter(Mandatory)][hashtable]$WordMap,
         [int]$MinLength = 30
     )
 
     while ($true) {
         $words = @()
-        for ($i=0; $i -lt 4; $i++) {
+
+        for ($i = 0; $i -lt 4; $i++) {
             $key = Roll-DiceKey
-            $word = $WordMap[$key] ?? "UNKNOWN"
-            $words += ($word.Substring(0,1).ToUpper() + $word.Substring(1).ToLower())
+            $word = $null
+
+            if ($WordMap.ContainsKey($key)) {
+                $word = $WordMap[$key]
+            } else {
+                $word = "UNKNOWN"
+            }
+
+            # Capitalize safely
+            if ($word.Length -gt 1) {
+                $cap = $word.Substring(0,1).ToUpper() + $word.Substring(1).ToLower()
+            } else {
+                $cap = $word.ToUpper()
+            }
+            $words += $cap
         }
 
-        $words[-1] += (Get-Random -Minimum 0 -Maximum 10)
-        $pw = ($words -join "-")
+        # Add a digit to satisfy typical complexity requirements
+        $digit = Get-Random -Minimum 0 -Maximum 10
+        $words[$words.Count - 1] = $words[$words.Count - 1] + $digit
 
+        $pw = ($words -join "-")
         if ($pw.Length -ge $MinLength) { return $pw }
     }
 }
@@ -120,27 +141,31 @@ function Ensure-Environment {
     try {
         Import-Module ActiveDirectory -ErrorAction Stop
     } catch {
-        throw "ActiveDirectory module not available. Run on AD management host."
+        throw "ActiveDirectory module not available. Run on an AD management host (RSAT installed)."
     }
 
     if (-not (Get-Command Connect-SecretServer -ErrorAction SilentlyContinue)) {
-        throw "Secret Server PowerShell module not found."
+        throw "Secret Server PowerShell module not found (Connect-SecretServer missing)."
     }
     if (-not (Get-Command Get-Secret -ErrorAction SilentlyContinue)) {
-        throw "Get-Secret cmdlet not found."
+        throw "Secret Server module missing Get-Secret cmdlet."
     }
 }
 
 # ---------------- Secret Server Helpers ----------------
 function Get-TssSecretById {
-    param([int]$Id)
+    param([Parameter(Mandatory)][int]$Id)
 
     $cmd = Get-Command Get-Secret -ErrorAction Stop
-    $params = $cmd.Parameters.Keys
+    $paramNames = $cmd.Parameters.Keys
 
     foreach ($p in @('SecretId','SecretID','Id','ID')) {
-        if ($params -contains $p) {
-            return Get-Secret @{$p = $Id}
+        if ($paramNames -contains $p) {
+            try {
+                return Get-Secret @{$p = $Id}
+            } catch {
+                throw "Secret not found or inaccessible in TSS (SecretId=$Id): $($_.Exception.Message)"
+            }
         }
     }
 
@@ -148,16 +173,44 @@ function Get-TssSecretById {
     try {
         return Get-Secret $Id
     } catch {
-        throw "Secret not found or inaccessible (SecretId=$Id)"
+        throw "Secret not found or inaccessible in TSS (SecretId=$Id): $($_.Exception.Message)"
     }
+}
+
+function Get-SecretFieldValue {
+    param(
+        [Parameter(Mandatory)]$Secret,
+        [Parameter(Mandatory)][string]$FieldName
+    )
+
+    # Many Secret Server modules expose fields as a hashtable/dictionary on .fields
+    if ($Secret -and $Secret.PSObject.Properties.Name -contains 'fields' -and $Secret.fields) {
+        try {
+            return $Secret.fields[$FieldName]
+        } catch {
+            return $null
+        }
+    }
+
+    # Some modules expose fields as direct properties
+    if ($Secret -and ($Secret.PSObject.Properties.Name -contains $FieldName)) {
+        try {
+            return $Secret.$FieldName
+        } catch {
+            return $null
+        }
+    }
+
+    return $null
 }
 
 function Update-TssPassword {
     param(
-        [int]$SecretId,
-        [string]$NewPassword
+        [Parameter(Mandatory)][int]$SecretId,
+        [Parameter(Mandatory)][string]$NewPassword
     )
 
+    # Try common cmdlets; adjust here if your module uses a different one.
     if (Get-Command Set-SecretField -ErrorAction SilentlyContinue) {
         Set-SecretField -SecretId $SecretId -FieldName "Password" -Value $NewPassword | Out-Null
         return
@@ -168,15 +221,15 @@ function Update-TssPassword {
         return
     }
 
-    throw "No supported Secret Server password update cmdlet found."
+    throw "No supported Secret Server password update cmdlet found (Set-SecretField / Update-SecretField)."
 }
 
 # ---------------- AD Action ----------------
 function Reset-ADPassword {
     param(
-        [string]$Username,
-        [string]$Domain,
-        [string]$Password
+        [Parameter(Mandatory)][string]$Username,
+        [Parameter(Mandatory)][string]$Domain,
+        [Parameter(Mandatory)][string]$Password
     )
 
     $secure = ConvertTo-SecureString $Password -AsPlainText -Force
@@ -185,14 +238,14 @@ function Reset-ADPassword {
 }
 
 # ===================== MAIN =====================
-Write-Log "Starting service account password rotation (DryRun=$DryRun)"
+Write-Log "Starting service account password rotation (DryRun=$DryRun)" "INFO"
 
 Ensure-Environment
 
-$ids      = Parse-SecretIds $SecretIds
+$ids = Parse-SecretIds $SecretIds
 $wordMap = Load-WordList $WordListPath
 
-Write-Log "Connecting to Secret Server..."
+Write-Log "Connecting to Secret Server..." "INFO"
 Connect-SecretServer -UseDefaultCredentials | Out-Null
 
 $failures = 0
@@ -201,33 +254,36 @@ foreach ($sid in $ids) {
     try {
         $secret = Get-TssSecretById -Id $sid
 
-        $username = $secret.fields["Username"]
-        $domain   = $secret.fields["Domain Name"]
+        $username = Get-SecretFieldValue -Secret $secret -FieldName "Username"
+        $domain   = Get-SecretFieldValue -Secret $secret -FieldName "Domain Name"
 
         if (-not $username -or -not $domain) {
-            throw "Required fields missing (Username / Domain Name)"
+            throw "Required fields missing in secret (need: 'Username' and 'Domain Name')."
         }
 
         if ($DryRun) {
-            Write-Log "[DRY-RUN] SecretId=$sid Would rotate $domain\$username"
+            Write-Log ("[DRY-RUN] SecretId={0} Would rotate {1}\{2} (AD reset + TSS password update)" -f $sid, $domain, $username) "INFO"
             continue
         }
 
         $newPw = New-DicewarePassword -WordMap $wordMap
 
+        # AD is source of truth
         Reset-ADPassword -Username $username -Domain $domain -Password $newPw
+
+        # Mirror to Secret Server only after AD succeeds
         Update-TssPassword -SecretId $sid -NewPassword $newPw
 
-        Write-Log "SecretId=$sid SUCCESS ($domain\$username)"
+        Write-Log ("SecretId={0} SUCCESS ({1}\{2})" -f $sid, $domain, $username) "INFO"
     }
     catch {
         $failures++
-        Write-Log "SecretId=$sid FAILED - $($_.Exception.Message)" "ERROR"
+        Write-Log ("SecretId={0} FAILED - {1}" -f $sid, $_.Exception.Message) "ERROR"
     }
 }
 
-Write-Log "Rotation complete. Total=$($ids.Count) Failed=$failures"
+Write-Log ("Rotation complete. Total={0} Failed={1}" -f $ids.Count, $failures) "INFO"
 
 if ($failures -gt 0) {
-    throw "$failures rotation(s) failed."
+    throw ("{0} rotation(s) failed." -f $failures)
 }
