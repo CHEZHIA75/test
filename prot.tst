@@ -9,12 +9,23 @@ OPTIONS:
   -DryRun
   -WordListPath "C:\tss_password_rotate\eff_wordlist"
 
-Secret Server module syntax confirmed:
+Secret Server cmdlet syntax confirmed:
   Get-Secret [-id] <int> [-include-inactive] [-full]
 
 Fields used from secret (PaaS Service Account template):
   - Username
   - Domain Name
+
+FLOW per SecretId:
+  1) Get secret from Secret Server (FULL)
+  2) Extract 'Username' and 'Domain Name'
+  3) Generate diceware-style password (>= 30 chars, trailing digit)
+  4) Reset AD password (Set-ADAccountPassword)
+  5) Update Secret Server password field
+
+NOTES:
+  - Never logs passwords
+  - Returns non-zero exit if any rotation fails
 #>
 
 [CmdletBinding()]
@@ -31,6 +42,7 @@ param(
 
 $ErrorActionPreference = "Stop"
 
+# ---------------- Logging ----------------
 function Write-Log {
     param(
         [Parameter(Mandatory)][string]$Message,
@@ -40,6 +52,7 @@ function Write-Log {
     Write-Output "$ts [$Level] $Message"
 }
 
+# ---------------- Utilities ----------------
 function Parse-SecretIds {
     param([string]$Value)
 
@@ -117,6 +130,7 @@ function New-DicewarePassword {
     }
 }
 
+# ---------------- Environment Checks ----------------
 function Ensure-Environment {
     try {
         Import-Module ActiveDirectory -ErrorAction Stop
@@ -132,12 +146,13 @@ function Ensure-Environment {
     }
 }
 
+# ---------------- Secret Server Helpers ----------------
 function Get-TssSecretById {
     param([Parameter(Mandatory)][int]$Id)
 
     try {
-        # Based on your confirmed syntax
-        return Get-Secret -id $Id
+        # IMPORTANT: -full ensures template fields are returned in most environments
+        return Get-Secret -id $Id -full
     } catch {
         throw "Secret not found or inaccessible in TSS (SecretId=$Id): $($_.Exception.Message)"
     }
@@ -149,14 +164,44 @@ function Get-SecretFieldValue {
         [Parameter(Mandatory)][string]$FieldName
     )
 
-    # Your module exposes fields under .fields (based on earlier objects you showed)
-    if ($Secret -and $Secret.PSObject.Properties.Name -contains 'fields' -and $Secret.fields) {
-        try { return $Secret.fields[$FieldName] } catch { return $null }
+    if (-not $Secret) { return $null }
+
+    # Case A: fields is a hashtable/dictionary
+    if ($Secret.PSObject.Properties.Name -contains 'fields' -and $Secret.fields) {
+        try {
+            $v = $Secret.fields[$FieldName]
+            if ($v) { return $v }
+        } catch { }
     }
 
-    # Fallback: direct property
-    if ($Secret -and ($Secret.PSObject.Properties.Name -contains $FieldName)) {
-        try { return $Secret.$FieldName } catch { return $null }
+    # Case B: SecretItems / Items / Fields arrays of objects
+    foreach ($containerName in @('SecretItems','Items','Fields','secretItems','items','fields')) {
+        if ($Secret.PSObject.Properties.Name -contains $containerName) {
+            $arr = $Secret.$containerName
+            if ($arr) {
+                foreach ($it in $arr) {
+                    $n = $null
+                    $val = $null
+
+                    # Most common shapes:
+                    if ($it.PSObject.Properties.Name -contains 'FieldName') { $n = $it.FieldName }
+                    elseif ($it.PSObject.Properties.Name -contains 'Name') { $n = $it.Name }
+
+                    if ($it.PSObject.Properties.Name -contains 'Value') { $val = $it.Value }
+                    elseif ($it.PSObject.Properties.Name -contains 'ItemValue') { $val = $it.ItemValue }
+
+                    if ($n -and ($n -eq $FieldName) -and $val) { return $val }
+                }
+            }
+        }
+    }
+
+    # Case C: direct properties (rare)
+    if ($Secret.PSObject.Properties.Name -contains $FieldName) {
+        try {
+            $v = $Secret.$FieldName
+            if ($v) { return $v }
+        } catch { }
     }
 
     return $null
@@ -168,6 +213,7 @@ function Update-TssPassword {
         [Parameter(Mandatory)][string]$NewPassword
     )
 
+    # Try common cmdlets; adjust here if your module uses a different one
     if (Get-Command Set-SecretField -ErrorAction SilentlyContinue) {
         Set-SecretField -SecretId $SecretId -FieldName "Password" -Value $NewPassword | Out-Null
         return
@@ -181,6 +227,7 @@ function Update-TssPassword {
     throw "No supported Secret Server password update cmdlet found (Set-SecretField / Update-SecretField)."
 }
 
+# ---------------- AD Action ----------------
 function Reset-ADPassword {
     param(
         [Parameter(Mandatory)][string]$Username,
@@ -224,7 +271,10 @@ foreach ($sid in $ids) {
 
         $newPw = New-DicewarePassword -WordMap $wordMap
 
+        # AD is source of truth
         Reset-ADPassword -Username $username -Domain $domain -Password $newPw
+
+        # Mirror to Secret Server only after AD succeeds
         Update-TssPassword -SecretId $sid -NewPassword $newPw
 
         Write-Log ("SecretId={0} SUCCESS ({1}\{2})" -f $sid, $domain, $username) "INFO"
