@@ -3,26 +3,37 @@ sa-password-reset.ps1  (Sequential, PowerShell 5.1+ compatible)
 
 Rotate AD Service Account passwords using Secret Server Secret IDs.
 
-Env cmdlets available:
+Your environment cmdlets (per your module listing):
   - Connect-SecretServer
   - Get-Secret        (Get-Secret [-id] <int> [-include-inactive] [-full])
   - Invoke-TSSRestMethod (Invoke-TSSRestMethod [-request] <object>)
 
+IMPORTANT (based on your module codebase screenshots):
+- Connect-SecretServer sets:
+    $env:TSSApiUrl = $api_base_url + "/SecretServer/api/v1"
+    $env:TSSUseDefaultCredentials = 'true' (for Windows auth)
+- Invoke-TSSRestMethod prepends:
+    $request.Uri = $env:TSSApiUrl + $request.Uri
+  So request objects MUST use a RELATIVE Uri like "/secrets/29671" (NOT full URL, NOT "/api/v1/...").
+
 Policy:
-- Only rotate if secret domain (fieldName: "Domain Name" OR "Domain") is in allowed list:
+- Only rotate if secret domain item exists and is in allow-list:
     nonprod.myac.gov.au
     management.health.gov.au
     myac.gov.au
     central.health.gov.au
-- If not allowed/missing => SKIP (no AD reset, no TSS update)
+- Domain item may be fieldName: "Domain Name" OR "Domain"
+- If domain missing or not allowed => SKIP (no AD reset, no TSS update)
 
 Flow per SecretId:
 1) Get secret (full)
-2) Extract Username (top-level) and Domain (from items)
+2) Extract Username (top-level property) and Domain (from items)
 3) Generate diceware password
 4) Reset AD password against discovered DC
 5) Update TSS password via Invoke-TSSRestMethod (PUT then POST fallback)
-   NOTE: request object is rebuilt fresh each call to avoid duplicate-key mutation (UseDefaultCredentials) errors.
+   - Updates itemValue of the password item (fieldName "Password"/slug "password"/isPassword true)
+   - Verifies after update by re-fetching and checking password itemValue changed
+   - Builds a fresh request object each call (Invoke-TSSRestMethod mutates request by adding UseDefaultCredentials)
 
 No passwords are printed or logged.
 #>
@@ -40,9 +51,8 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
-$TssBaseUrl = "https://safe.myac.gov.au"
 
-# Only these domains are eligible.
+# Only these domains are eligible for rotation.
 $AllowedDomains = @(
     "nonprod.myac.gov.au",
     "Management.health.gov.au",
@@ -162,66 +172,6 @@ function Find-PasswordItem {
     return $null
 }
 
-# Set this near the top of the script if you can't find an env var:
-# $TssBaseUrl = "https://safe.myac.gov.au"
-
-function Get-TssBaseUrl {
-    # Try common env var names first (module likely sets one)
-    foreach ($n in @('TSS_URL','TSSBaseUrl','TSS_BASEURL','TSS_SERVER','TSSEndpoint','SECRET_SERVER_URL','SECRETSERVER_URL')) {
-        $v = [string](Get-Item "env:$n" -ErrorAction SilentlyContinue).Value
-        if ($v -and $v.StartsWith("http")) { return $v.TrimEnd('/') }
-    }
-    # Fallback to hardcoded value if you prefer
-    return "https://safe.myac.gov.au"
-}
-
-function Update-TssPassword {
-    param([int]$SecretId, [string]$NewPassword)
-
-    $sec = Get-Secret -id $SecretId -full
-    if (-not $sec.items) { throw "SecretId=${SecretId}: cannot update because items payload is missing." }
-
-    $pwItem = Find-PasswordItem -Secret $sec
-    if (-not $pwItem) { throw "SecretId=${SecretId}: could not locate password item (fieldName/slug/isPassword)." }
-
-    # Update itemValue (confirmed in your environment)
-    $pwItem.itemValue = $NewPassword
-
-    $bodyObj = @{
-        id    = $sec.id
-        name  = $sec.name
-        items = $sec.items
-    }
-
-    $base = Get-TssBaseUrl
-    $uri  = "$base/api/v1/secrets/$SecretId"
-
-    # IMPORTANT: build a fresh request object per call (module mutates request hashtable)
-    function New-TssRequest([string]$method) {
-        return @{
-            Method      = $method
-            Uri         = $uri
-            Body        = ($bodyObj | ConvertTo-Json -Depth 20)
-            ContentType = "application/json"
-        }
-    }
-
-    try {
-        $reqPut = New-TssRequest "PUT"
-        Invoke-TSSRestMethod -request $reqPut | Out-Null
-        return
-    } catch {
-        try {
-            $reqPost = New-TssRequest "POST"
-            Invoke-TSSRestMethod -request $reqPost | Out-Null
-            return
-        } catch {
-            throw "SecretId=${SecretId}: failed to update password via TSS REST API. $($_.Exception.Message)"
-        }
-    }
-}
-
-
 function Reset-ADPassword {
     param([string]$Username, [string]$Domain, [string]$Password)
 
@@ -232,7 +182,7 @@ function Reset-ADPassword {
         throw "Unable to discover a Domain Controller for domain '${Domain}'. $($_.Exception.Message)"
     }
 
-    # In your env HostName is a collection like {AV1WPRDADS02.myac.gov.au}
+    # In your environment HostName is a collection like {AV1WPRDADS02.myac.gov.au}
     $serverObj = $dc.HostName
     if (-not $serverObj) { $serverObj = $dc.Name }
     if (-not $serverObj) { throw "DC discovery returned no HostName/Name for domain '${Domain}'." }
@@ -248,6 +198,64 @@ function Reset-ADPassword {
     Unlock-ADAccount -Identity $Username -Server $server -ErrorAction SilentlyContinue
 }
 
+function Update-TssPassword {
+    param([int]$SecretId, [string]$NewPassword)
+
+    # NOTE: We rely on Connect-SecretServer + Invoke-TSSRestMethod to set/prepend $env:TSSApiUrl.
+    # Request.Uri MUST be relative like "/secrets/29671".
+    if (-not $env:TSSApiUrl) {
+        throw "TSSApiUrl environment variable is not set. Ensure Connect-SecretServer ran successfully."
+    }
+
+    $sec = Get-Secret -id $SecretId -full
+    if (-not $sec.items) { throw "SecretId=${SecretId}: cannot update because items payload is missing." }
+
+    $pwItem = Find-PasswordItem -Secret $sec
+    if (-not $pwItem) { throw "SecretId=${SecretId}: could not locate password item." }
+
+    # Old value for verification (do not print)
+    $oldValue = $pwItem.itemValue
+
+    # Update password itemValue
+    $pwItem.itemValue = $NewPassword
+
+    # Build JSON payload
+    $payload = @{
+        id    = $sec.id
+        name  = $sec.name
+        items = $sec.items
+    } | ConvertTo-Json -Depth 30
+
+    $relUri = "/secrets/$SecretId"
+
+    function New-TssRequest([string]$method) {
+        # Fresh object each call to avoid duplicate-key mutation issues inside Invoke-TSSRestMethod
+        return @{
+            Method      = $method
+            Uri         = $relUri
+            Body        = $payload
+            ContentType = "application/json"
+        }
+    }
+
+    # PUT then POST fallback
+    try {
+        Invoke-TSSRestMethod -request (New-TssRequest "PUT") | Out-Null
+    } catch {
+        Invoke-TSSRestMethod -request (New-TssRequest "POST") | Out-Null
+    }
+
+    # Verify update applied
+    Start-Sleep -Seconds 1
+    $sec2 = Get-Secret -id $SecretId -full
+    $pw2 = Find-PasswordItem -Secret $sec2
+    if (-not $pw2) { throw "SecretId=${SecretId}: verification failed (password item missing after refresh)." }
+
+    if ($pw2.itemValue -eq $oldValue) {
+        throw "SecretId=${SecretId}: TSS update call returned but password value did not change (verification failed)."
+    }
+}
+
 # ---------------- MAIN ----------------
 Write-Log "Starting service account password rotation (DryRun=$DryRun)" "INFO"
 Ensure-Environment
@@ -258,12 +266,18 @@ $wordMap = Load-WordList $WordListPath
 Write-Log "Connecting to Secret Server..." "INFO"
 Connect-SecretServer -UseDefaultCredentials | Out-Null
 
+# Optional quick sanity: ensure module env vars exist after connect
+if (-not $env:TSSApiUrl) {
+    Write-Log "WARNING: env:TSSApiUrl not set after Connect-SecretServer; REST updates may fail." "WARN"
+}
+
 $failures = 0
 
 foreach ($sid in $ids) {
     try {
         $secret = Get-TssSecretById -Id $sid
 
+        # Username is a top-level property in your module output
         if (-not ($secret.PSObject.Properties.Name -contains 'Username') -or -not $secret.Username) {
             throw "SecretId=${sid}: missing Username."
         }
@@ -285,7 +299,10 @@ foreach ($sid in $ids) {
 
         $newPw = New-DicewarePassword -WordMap $wordMap
 
+        # AD is source of truth
         Reset-ADPassword -Username $username -Domain $domainName -Password $newPw
+
+        # Mirror into TSS and verify
         Update-TssPassword -SecretId $sid -NewPassword $newPw
 
         Write-Log ("SecretId={0} SUCCESS ({1}\{2})" -f $sid, $domainName, $username) "INFO"
