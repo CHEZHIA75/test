@@ -1,3 +1,32 @@
+<#
+sa-password-reset.ps1  (Sequential, PowerShell 5.1+ compatible)
+
+Rotate AD Service Account passwords using Secret Server Secret IDs.
+
+Env cmdlets available:
+  - Connect-SecretServer
+  - Get-Secret        (Get-Secret [-id] <int> [-include-inactive] [-full])
+  - Invoke-TSSRestMethod (Invoke-TSSRestMethod [-request] <object>)
+
+Policy:
+- Only rotate if secret domain (fieldName: "Domain Name" OR "Domain") is in allowed list:
+    nonprod.myac.gov.au
+    management.health.gov.au
+    myac.gov.au
+    central.health.gov.au
+- If not allowed/missing => SKIP (no AD reset, no TSS update)
+
+Flow per SecretId:
+1) Get secret (full)
+2) Extract Username (top-level) and Domain (from items)
+3) Generate diceware password
+4) Reset AD password against discovered DC
+5) Update TSS password via Invoke-TSSRestMethod (PUT then POST fallback)
+   NOTE: request object is rebuilt fresh each call to avoid duplicate-key mutation (UseDefaultCredentials) errors.
+
+No passwords are printed or logged.
+#>
+
 [CmdletBinding()]
 param(
     [Parameter(Mandatory)]
@@ -12,6 +41,7 @@ param(
 
 $ErrorActionPreference = "Stop"
 
+# Only these domains are eligible.
 $AllowedDomains = @(
     "nonprod.myac.gov.au",
     "Management.health.gov.au",
@@ -30,6 +60,7 @@ function Write-Log {
 
 function Parse-SecretIds {
     param([string]$Value)
+
     $parts = $Value.Split(',') | ForEach-Object { $_.Trim() } | Where-Object { $_ }
     if (-not $parts -or $parts.Count -eq 0) { throw "No valid SecretIds provided." }
 
@@ -65,6 +96,7 @@ function Roll-DiceKey {
 
 function New-DicewarePassword {
     param([hashtable]$WordMap, [int]$MinLength = 30)
+
     while ($true) {
         $words = @()
         for ($i = 0; $i -lt 4; $i++) {
@@ -138,24 +170,37 @@ function Update-TssPassword {
     $pwItem = Find-PasswordItem -Secret $sec
     if (-not $pwItem) { throw "SecretId=${SecretId}: could not locate password item (fieldName/slug/isPassword)." }
 
+    # Update itemValue (confirmed in your environment)
     $pwItem.itemValue = $NewPassword
 
-    $req = @{
-        Method = 'PUT'
-        Path   = "/api/v1/secrets/$SecretId"
-        Body   = @{
-            id    = $sec.id
-            name  = $sec.name
-            items = $sec.items
+    # Build BODY once
+    $body = @{
+        id    = $sec.id
+        name  = $sec.name
+        items = $sec.items
+    }
+
+    $path = "/api/v1/secrets/$SecretId"
+
+    # IMPORTANT: Invoke-TSSRestMethod mutates request object (adds UseDefaultCredentials, etc).
+    # So we build a fresh request object each time to avoid duplicate-key "Add" errors.
+    function New-TssRequest([string]$method) {
+        return @{
+            Method = $method
+            Path   = $path
+            Body   = $body
         }
     }
 
     try {
-        Invoke-TSSRestMethod -request $req | Out-Null
+        $reqPut = New-TssRequest "PUT"
+        Invoke-TSSRestMethod -request $reqPut | Out-Null
+        return
     } catch {
-        $req.Method = 'POST'
         try {
-            Invoke-TSSRestMethod -request $req | Out-Null
+            $reqPost = New-TssRequest "POST"
+            Invoke-TSSRestMethod -request $reqPost | Out-Null
+            return
         } catch {
             throw "SecretId=${SecretId}: failed to update password via TSS REST API. $($_.Exception.Message)"
         }
@@ -172,6 +217,7 @@ function Reset-ADPassword {
         throw "Unable to discover a Domain Controller for domain '${Domain}'. $($_.Exception.Message)"
     }
 
+    # In your env HostName is a collection like {AV1WPRDADS02.myac.gov.au}
     $serverObj = $dc.HostName
     if (-not $serverObj) { $serverObj = $dc.Name }
     if (-not $serverObj) { throw "DC discovery returned no HostName/Name for domain '${Domain}'." }
