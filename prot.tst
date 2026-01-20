@@ -1,27 +1,3 @@
-<#
-sa-password-reset.ps1  (Sequential, PowerShell 5.1+ compatible)
-
-Rotate AD Service Account passwords using Secret Server Secret IDs.
-
-ENV cmdlets available:
-  - Connect-SecretServer
-  - Get-Secret        (Get-Secret [-id] <int> [-include-inactive] [-full])
-  - Invoke-TSSRestMethod (Invoke-TSSRestMethod [-request] <object>)
-
-NEW POLICY:
-- Only rotate if secret has field/property 'Domain Name' AND it is in the approved DC domain list:
-    nonprod.myac.gov.au
-    Management.health.gov.au
-    myac.gov.au
-    central.health
-- If NOT, skip BOTH AD update and Secret Server update (log SKIPPED).
-
-Fields:
-- Username: secret.Username (top-level)
-- Domain Name: secret.'Domain Name' (top-level). If not present -> SKIP.
-
-#>
-
 [CmdletBinding()]
 param(
     [Parameter(Mandatory)]
@@ -36,7 +12,6 @@ param(
 
 $ErrorActionPreference = "Stop"
 
-# ---- Approved AD domains (exact match, case-insensitive) ----
 $AllowedDomains = @(
     "nonprod.myac.gov.au",
     "Management.health.gov.au",
@@ -118,21 +93,19 @@ function Get-TssSecretById {
     catch { throw "Secret not found or inaccessible in TSS (SecretId=${Id}): $($_.Exception.Message)" }
 }
 
-function Get-SecretUsername {
-    param($Secret)
-    if ($Secret.PSObject.Properties.Name -contains 'Username' -and $Secret.Username) { return [string]$Secret.Username }
-    return $null
-}
+function Get-ItemValueByAnyFieldName {
+    param(
+        [Parameter(Mandatory)]$Secret,
+        [Parameter(Mandatory)][string[]]$FieldNames
+    )
 
-function Get-SecretDomainNameField {
-    param($Secret)
+    if (-not ($Secret.PSObject.Properties.Name -contains 'items') -or -not $Secret.items) { return $null }
 
-    # We ONLY trust the Domain Name field/property now.
-    # Some modules might expose it as 'Domain Name' exactly; try three variants.
-    foreach ($prop in @('Domain Name','DomainName','Domain')) {
-        if ($Secret.PSObject.Properties.Name -contains $prop) {
-            $v = $Secret.$prop
-            if ($v) { return ([string]$v).ToLower() }
+    foreach ($name in $FieldNames) {
+        foreach ($it in $Secret.items) {
+            if ($it.fieldName -eq $name) {
+                return $it.itemValue
+            }
         }
     }
     return $null
@@ -140,49 +113,32 @@ function Get-SecretDomainNameField {
 
 function Is-AllowedDomain {
     param([string]$DomainName)
-
     if (-not $DomainName) { return $false }
-    $d = $DomainName.ToLower()
-    return ($AllowedDomains -contains $d)
+    return ($AllowedDomains -contains $DomainName.ToLower())
 }
 
-function Set-SecretItemValue {
-    param($Item, [string]$Value)
-    if ($Item.PSObject.Properties.Name -contains 'itemValue') { $Item.itemValue = $Value; return $true }
-    if ($Item.PSObject.Properties.Name -contains 'ItemValue') { $Item.ItemValue = $Value; return $true }
-    if ($Item.PSObject.Properties.Name -contains 'value') { $Item.value = $Value; return $true }
-    if ($Item.PSObject.Properties.Name -contains 'Value') { $Item.Value = $Value; return $true }
-    return $false
+function Find-PasswordItem {
+    param([Parameter(Mandatory)]$Secret)
+
+    if (-not ($Secret.PSObject.Properties.Name -contains 'items') -or -not $Secret.items) { return $null }
+
+    foreach ($it in $Secret.items) { if ($it.fieldName -eq "Password") { return $it } }
+    foreach ($it in $Secret.items) { if ($it.slug -eq "password") { return $it } }
+    foreach ($it in $Secret.items) { if ($it.PSObject.Properties.Name -contains 'isPassword' -and $it.isPassword -eq $true) { return $it } }
+
+    return $null
 }
 
 function Update-TssPassword {
     param([int]$SecretId, [string]$NewPassword)
 
     $sec = Get-Secret -id $SecretId -full
+    if (-not $sec.items) { throw "SecretId=${SecretId}: cannot update because items payload is missing." }
 
-    if (-not ($sec.PSObject.Properties.Name -contains 'items') -or -not $sec.items) {
-        throw "SecretId=${SecretId}: cannot update because 'items' payload is missing."
-    }
+    $pwItem = Find-PasswordItem -Secret $sec
+    if (-not $pwItem) { throw "SecretId=${SecretId}: could not locate password item (fieldName/slug/isPassword)." }
 
-    $updated = $false
-    $pwFieldNames = @('Password','password','Passphrase','passphrase')
-
-    foreach ($it in $sec.items) {
-        $fieldName = $null
-        if ($it.PSObject.Properties.Name -contains 'fieldName') { $fieldName = $it.fieldName }
-        elseif ($it.PSObject.Properties.Name -contains 'FieldName') { $fieldName = $it.FieldName }
-        elseif ($it.PSObject.Properties.Name -contains 'name') { $fieldName = $it.name }
-        elseif ($it.PSObject.Properties.Name -contains 'Name') { $fieldName = $it.Name }
-
-        if ($fieldName -and ($pwFieldNames -contains $fieldName)) {
-            $updated = (Set-SecretItemValue -Item $it -Value $NewPassword)
-            if ($updated) { break }
-        }
-    }
-
-    if (-not $updated) {
-        throw "SecretId=${SecretId}: password field not found in secret items."
-    }
+    $pwItem.itemValue = $NewPassword
 
     $req = @{
         Method = 'PUT'
@@ -196,15 +152,11 @@ function Update-TssPassword {
 
     try {
         Invoke-TSSRestMethod -request $req | Out-Null
-        return
-    }
-    catch {
+    } catch {
         $req.Method = 'POST'
         try {
             Invoke-TSSRestMethod -request $req | Out-Null
-            return
-        }
-        catch {
+        } catch {
             throw "SecretId=${SecretId}: failed to update password via TSS REST API. $($_.Exception.Message)"
         }
     }
@@ -213,8 +165,6 @@ function Update-TssPassword {
 function Reset-ADPassword {
     param([string]$Username, [string]$Domain, [string]$Password)
 
-    # Domain here is one of the allowed domain controller domains.
-    # Discover an available DC for that domain.
     $dc = $null
     try {
         $dc = Get-ADDomainController -Discover -DomainName $Domain -ErrorAction Stop
@@ -222,9 +172,15 @@ function Reset-ADPassword {
         throw "Unable to discover a Domain Controller for domain '${Domain}'. $($_.Exception.Message)"
     }
 
-    $server = $dc.HostName
-    if (-not $server) { $server = $dc.Name }
-    if (-not $server) { throw "Domain controller discovery returned no hostname for domain '${Domain}'." }
+    $serverObj = $dc.HostName
+    if (-not $serverObj) { $serverObj = $dc.Name }
+    if (-not $serverObj) { throw "DC discovery returned no HostName/Name for domain '${Domain}'." }
+
+    if ($serverObj -is [Microsoft.ActiveDirectory.Management.ADPropertyValueCollection]) { $serverObj = $serverObj[0] }
+    elseif ($serverObj -is [System.Array]) { $serverObj = $serverObj[0] }
+
+    $server = ([string]$serverObj).Trim()
+    if ($server -eq "") { throw "Resolved DC hostname is empty for domain '${Domain}'." }
 
     $secure = ConvertTo-SecureString $Password -AsPlainText -Force
     Set-ADAccountPassword -Identity $Username -Reset -NewPassword $secure -Server $server -ErrorAction Stop
@@ -233,8 +189,8 @@ function Reset-ADPassword {
 
 # ---------------- MAIN ----------------
 Write-Log "Starting service account password rotation (DryRun=$DryRun)" "INFO"
-
 Ensure-Environment
+
 $ids = Parse-SecretIds $SecretIds
 $wordMap = Load-WordList $WordListPath
 
@@ -247,14 +203,17 @@ foreach ($sid in $ids) {
     try {
         $secret = Get-TssSecretById -Id $sid
 
-        $username = Get-SecretUsername -Secret $secret
-        if (-not $username) { throw "SecretId=${sid}: missing Username." }
+        if (-not ($secret.PSObject.Properties.Name -contains 'Username') -or -not $secret.Username) {
+            throw "SecretId=${sid}: missing Username."
+        }
+        $username = [string]$secret.Username
 
-        $domainName = Get-SecretDomainNameField -Secret $secret
+        # Domain can be either "Domain Name" or "Domain"
+        $domainName = Get-ItemValueByAnyFieldName -Secret $secret -FieldNames @("Domain Name","Domain")
+        if ($domainName) { $domainName = ([string]$domainName).ToLower() }
 
-        # Enforce your new policy
         if (-not (Is-AllowedDomain -DomainName $domainName)) {
-            Write-Log ("SecretId={0} SKIPPED - Domain Name '{1}' not in allowed list. No AD/TSS rotation performed." -f $sid, $domainName) "WARN"
+            Write-Log ("SecretId={0} SKIPPED - Domain '{1}' not in allowed list. No AD/TSS rotation performed." -f $sid, $domainName) "WARN"
             continue
         }
 
