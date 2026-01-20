@@ -201,60 +201,49 @@ function Reset-ADPassword {
 function Update-TssPassword {
     param([int]$SecretId, [string]$NewPassword)
 
-    # NOTE: We rely on Connect-SecretServer + Invoke-TSSRestMethod to set/prepend $env:TSSApiUrl.
-    # Request.Uri MUST be relative like "/secrets/29671".
-    if (-not $env:TSSApiUrl) {
-        throw "TSSApiUrl environment variable is not set. Ensure Connect-SecretServer ran successfully."
-    }
-
     $sec = Get-Secret -id $SecretId -full
     if (-not $sec.items) { throw "SecretId=${SecretId}: cannot update because items payload is missing." }
 
     $pwItem = Find-PasswordItem -Secret $sec
     if (-not $pwItem) { throw "SecretId=${SecretId}: could not locate password item." }
 
-    # Old value for verification (do not print)
     $oldValue = $pwItem.itemValue
-
-    # Update password itemValue
     $pwItem.itemValue = $NewPassword
 
-    # Build JSON payload
-    $payload = @{
-        id    = $sec.id
-        name  = $sec.name
-        items = $sec.items
-    } | ConvertTo-Json -Depth 30
+    $body = @{
+        id              = $sec.id
+        name            = $sec.name
+        secretTemplateId= $sec.secretTemplateId
+        folderId        = $sec.folderId
+        active          = $sec.active
+        items           = $sec.items
+    } | ConvertTo-Json -Depth 50
 
-    $relUri = "/secrets/$SecretId"
-
-    function New-TssRequest([string]$method) {
-        # Fresh object each call to avoid duplicate-key mutation issues inside Invoke-TSSRestMethod
-        return @{
-            Method      = $method
-            Uri         = $relUri
-            Body        = $payload
-            ContentType = "application/json"
-        }
+    # Fresh request object each time (module mutates request)
+    $req = @{
+        Method      = "PUT"
+        Uri         = "/secrets/$SecretId"
+        Body        = $body
+        ContentType = "application/json"
     }
 
-    # PUT then POST fallback
     try {
-        Invoke-TSSRestMethod -request (New-TssRequest "PUT") | Out-Null
+        Invoke-TSSRestMethod -request $req | Out-Null
     } catch {
-        Invoke-TSSRestMethod -request (New-TssRequest "POST") | Out-Null
+        throw "SecretId=${SecretId}: TSS PUT update failed. $($_.Exception.Message)"
     }
 
-    # Verify update applied
+    # Verify
     Start-Sleep -Seconds 1
     $sec2 = Get-Secret -id $SecretId -full
     $pw2 = Find-PasswordItem -Secret $sec2
     if (-not $pw2) { throw "SecretId=${SecretId}: verification failed (password item missing after refresh)." }
 
     if ($pw2.itemValue -eq $oldValue) {
-        throw "SecretId=${SecretId}: TSS update call returned but password value did not change (verification failed)."
+        throw "SecretId=${SecretId}: update call returned but password value did not change (verification failed)."
     }
 }
+
 
 # ---------------- MAIN ----------------
 Write-Log "Starting service account password rotation (DryRun=$DryRun)" "INFO"
