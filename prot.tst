@@ -1,3 +1,27 @@
+<#
+sa-password-reset.ps1  (Sequential, PowerShell 5.1+ compatible)
+
+Rotate AD Service Account passwords using Secret Server Secret IDs.
+
+ENV cmdlets available:
+  - Connect-SecretServer
+  - Get-Secret        (Get-Secret [-id] <int> [-include-inactive] [-full])
+  - Invoke-TSSRestMethod (Invoke-TSSRestMethod [-request] <object>)
+
+NEW POLICY:
+- Only rotate if secret has field/property 'Domain Name' AND it is in the approved DC domain list:
+    nonprod.myac.gov.au
+    Management.health.gov.au
+    myac.gov.au
+    central.health
+- If NOT, skip BOTH AD update and Secret Server update (log SKIPPED).
+
+Fields:
+- Username: secret.Username (top-level)
+- Domain Name: secret.'Domain Name' (top-level). If not present -> SKIP.
+
+#>
+
 [CmdletBinding()]
 param(
     [Parameter(Mandatory)]
@@ -11,6 +35,14 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
+
+# ---- Approved AD domains (exact match, case-insensitive) ----
+$AllowedDomains = @(
+    "nonprod.myac.gov.au",
+    "Management.health.gov.au",
+    "myac.gov.au",
+    "central.health"
+)
 
 function Write-Log {
     param(
@@ -92,22 +124,26 @@ function Get-SecretUsername {
     return $null
 }
 
-function Get-SecretDomain {
+function Get-SecretDomainNameField {
     param($Secret)
 
-    foreach ($prop in @('Domain Name','DomainName','Domain','domain','domainName')) {
+    # We ONLY trust the Domain Name field/property now.
+    # Some modules might expose it as 'Domain Name' exactly; try three variants.
+    foreach ($prop in @('Domain Name','DomainName','Domain')) {
         if ($Secret.PSObject.Properties.Name -contains $prop) {
             $v = $Secret.$prop
-            if ($v) { return [string]$v }
+            if ($v) { return ([string]$v).ToLower() }
         }
     }
-
-    if ($Secret.PSObject.Properties.Name -contains 'name' -and $Secret.name) {
-        $n = [string]$Secret.name
-        if ($n -match '@(.+)$') { return $Matches[1] }
-    }
-
     return $null
+}
+
+function Is-AllowedDomain {
+    param([string]$DomainName)
+
+    if (-not $DomainName) { return $false }
+    $d = $DomainName.ToLower()
+    return ($AllowedDomains -contains $d)
 }
 
 function Set-SecretItemValue {
@@ -176,9 +212,23 @@ function Update-TssPassword {
 
 function Reset-ADPassword {
     param([string]$Username, [string]$Domain, [string]$Password)
+
+    # Domain here is one of the allowed domain controller domains.
+    # Discover an available DC for that domain.
+    $dc = $null
+    try {
+        $dc = Get-ADDomainController -Discover -DomainName $Domain -ErrorAction Stop
+    } catch {
+        throw "Unable to discover a Domain Controller for domain '${Domain}'. $($_.Exception.Message)"
+    }
+
+    $server = $dc.HostName
+    if (-not $server) { $server = $dc.Name }
+    if (-not $server) { throw "Domain controller discovery returned no hostname for domain '${Domain}'." }
+
     $secure = ConvertTo-SecureString $Password -AsPlainText -Force
-    Set-ADAccountPassword -Identity $Username -Reset -NewPassword $secure -Server $Domain -ErrorAction Stop
-    Unlock-ADAccount -Identity $Username -Server $Domain -ErrorAction SilentlyContinue
+    Set-ADAccountPassword -Identity $Username -Reset -NewPassword $secure -Server $server -ErrorAction Stop
+    Unlock-ADAccount -Identity $Username -Server $server -ErrorAction SilentlyContinue
 }
 
 # ---------------- MAIN ----------------
@@ -200,20 +250,25 @@ foreach ($sid in $ids) {
         $username = Get-SecretUsername -Secret $secret
         if (-not $username) { throw "SecretId=${sid}: missing Username." }
 
-        $domain = Get-SecretDomain -Secret $secret
-        if (-not $domain) { throw "SecretId=${sid}: could not determine domain (no domain field and name not user@domain)." }
+        $domainName = Get-SecretDomainNameField -Secret $secret
+
+        # Enforce your new policy
+        if (-not (Is-AllowedDomain -DomainName $domainName)) {
+            Write-Log ("SecretId={0} SKIPPED - Domain Name '{1}' not in allowed list. No AD/TSS rotation performed." -f $sid, $domainName) "WARN"
+            continue
+        }
 
         if ($DryRun) {
-            Write-Log ("[DRY-RUN] SecretId={0} Would rotate {1}\{2} (AD reset + TSS password update)" -f $sid, $domain, $username) "INFO"
+            Write-Log ("[DRY-RUN] SecretId={0} Would rotate {1}\{2} (AD reset + TSS password update)" -f $sid, $domainName, $username) "INFO"
             continue
         }
 
         $newPw = New-DicewarePassword -WordMap $wordMap
 
-        Reset-ADPassword -Username $username -Domain $domain -Password $newPw
+        Reset-ADPassword -Username $username -Domain $domainName -Password $newPw
         Update-TssPassword -SecretId $sid -NewPassword $newPw
 
-        Write-Log ("SecretId={0} SUCCESS ({1}\{2})" -f $sid, $domain, $username) "INFO"
+        Write-Log ("SecretId={0} SUCCESS ({1}\{2})" -f $sid, $domainName, $username) "INFO"
     }
     catch {
         $failures++
