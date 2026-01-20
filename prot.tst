@@ -40,6 +40,7 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
+$TssBaseUrl = "https://safe.myac.gov.au"
 
 # Only these domains are eligible.
 $AllowedDomains = @(
@@ -161,6 +162,19 @@ function Find-PasswordItem {
     return $null
 }
 
+# Set this near the top of the script if you can't find an env var:
+# $TssBaseUrl = "https://safe.myac.gov.au"
+
+function Get-TssBaseUrl {
+    # Try common env var names first (module likely sets one)
+    foreach ($n in @('TSS_URL','TSSBaseUrl','TSS_BASEURL','TSS_SERVER','TSSEndpoint','SECRET_SERVER_URL','SECRETSERVER_URL')) {
+        $v = [string](Get-Item "env:$n" -ErrorAction SilentlyContinue).Value
+        if ($v -and $v.StartsWith("http")) { return $v.TrimEnd('/') }
+    }
+    # Fallback to hardcoded value if you prefer
+    return "https://safe.myac.gov.au"
+}
+
 function Update-TssPassword {
     param([int]$SecretId, [string]$NewPassword)
 
@@ -173,22 +187,22 @@ function Update-TssPassword {
     # Update itemValue (confirmed in your environment)
     $pwItem.itemValue = $NewPassword
 
-    # Build BODY once
-    $body = @{
+    $bodyObj = @{
         id    = $sec.id
         name  = $sec.name
         items = $sec.items
     }
 
-    $path = "/api/v1/secrets/$SecretId"
+    $base = Get-TssBaseUrl
+    $uri  = "$base/api/v1/secrets/$SecretId"
 
-    # IMPORTANT: Invoke-TSSRestMethod mutates request object (adds UseDefaultCredentials, etc).
-    # So we build a fresh request object each time to avoid duplicate-key "Add" errors.
+    # IMPORTANT: build a fresh request object per call (module mutates request hashtable)
     function New-TssRequest([string]$method) {
         return @{
-            Method = $method
-            Path   = $path
-            Body   = $body
+            Method      = $method
+            Uri         = $uri
+            Body        = ($bodyObj | ConvertTo-Json -Depth 20)
+            ContentType = "application/json"
         }
     }
 
@@ -206,6 +220,7 @@ function Update-TssPassword {
         }
     }
 }
+
 
 function Reset-ADPassword {
     param([string]$Username, [string]$Domain, [string]$Password)
