@@ -304,3 +304,27 @@ foreach ($sid in $ids) {
 
 Write-Log ("Rotation complete. Total={0} Failed={1}" -f $ids.Count, $failures) "INFO"
 if ($failures -gt 0) { throw ("{0} rotation(s) failed." -f $failures) }
+
+$sec = Get-Secret -id 29671 -full
+$pw = ($sec.items | Where-Object { $_.fieldName -eq "Password" -or $_.slug -eq "password" -or $_.isPassword -eq $true } | Select-Object -First 1)
+$pw.itemValue = "TEST-DO-NOT-USE-12345"
+
+# Some APIs choke on responseCodes; remove it if present
+if ($sec.PSObject.Properties.Name -contains "responseCodes") { $sec.responseCodes = $null }
+
+$json = $sec | ConvertTo-Json -Depth 80
+
+try {
+  Invoke-TSSRestMethod -request @{
+    Method="PUT"
+    Uri="/secrets/29671"
+    Body=$json
+    ContentType="application/json"
+  } | Out-Null
+  "PUT returned OK"
+} catch {
+  "STATUS: " + $_.Exception.Message
+  "BODY:"
+  Get-HttpErrorBody $_
+}
+
