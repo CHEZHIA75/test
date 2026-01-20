@@ -199,7 +199,14 @@ function Reset-ADPassword {
 }
 
 function Update-TssPassword {
-    param([int]$SecretId, [string]$NewPassword)
+    param(
+        [Parameter(Mandatory)][int]$SecretId,
+        [Parameter(Mandatory)][string]$NewPassword
+    )
+
+    if (-not $env:TSSApiUrl) {
+        throw "TSSApiUrl environment variable is not set. Ensure Connect-SecretServer ran successfully."
+    }
 
     $sec = Get-Secret -id $SecretId -full
     if (-not $sec.items) { throw "SecretId=${SecretId}: cannot update because items payload is missing." }
@@ -208,39 +215,39 @@ function Update-TssPassword {
     if (-not $pwItem) { throw "SecretId=${SecretId}: could not locate password item." }
 
     $oldValue = $pwItem.itemValue
+
+    # Update only the password value (do not log it)
     $pwItem.itemValue = $NewPassword
 
-    $body = @{
-        id              = $sec.id
-        name            = $sec.name
-        secretTemplateId= $sec.secretTemplateId
-        folderId        = $sec.folderId
-        active          = $sec.active
-        items           = $sec.items
-    } | ConvertTo-Json -Depth 50
+    # These often cause validation problems when echoing a GET object back into PUT
+    if ($sec.PSObject.Properties.Name -contains "responseCodes") { $sec.responseCodes = $null }
 
-    # Fresh request object each time (module mutates request)
+    # Convert the FULL secret object to JSON
+    $json = $sec | ConvertTo-Json -Depth 80
+
+    # Fresh request object (Invoke-TSSRestMethod mutates the hashtable)
     $req = @{
         Method      = "PUT"
         Uri         = "/secrets/$SecretId"
-        Body        = $body
+        Body        = $json
         ContentType = "application/json"
     }
 
     try {
         Invoke-TSSRestMethod -request $req | Out-Null
-    } catch {
+    }
+    catch {
         throw "SecretId=${SecretId}: TSS PUT update failed. $($_.Exception.Message)"
     }
 
-    # Verify
+    # Verify it actually changed
     Start-Sleep -Seconds 1
     $sec2 = Get-Secret -id $SecretId -full
     $pw2 = Find-PasswordItem -Secret $sec2
     if (-not $pw2) { throw "SecretId=${SecretId}: verification failed (password item missing after refresh)." }
 
     if ($pw2.itemValue -eq $oldValue) {
-        throw "SecretId=${SecretId}: update call returned but password value did not change (verification failed)."
+        throw "SecretId=${SecretId}: update call returned OK but password value did not change (verification failed)."
     }
 }
 
@@ -304,27 +311,3 @@ foreach ($sid in $ids) {
 
 Write-Log ("Rotation complete. Total={0} Failed={1}" -f $ids.Count, $failures) "INFO"
 if ($failures -gt 0) { throw ("{0} rotation(s) failed." -f $failures) }
-
-$sec = Get-Secret -id 29671 -full
-$pw = ($sec.items | Where-Object { $_.fieldName -eq "Password" -or $_.slug -eq "password" -or $_.isPassword -eq $true } | Select-Object -First 1)
-$pw.itemValue = "TEST-DO-NOT-USE-12345"
-
-# Some APIs choke on responseCodes; remove it if present
-if ($sec.PSObject.Properties.Name -contains "responseCodes") { $sec.responseCodes = $null }
-
-$json = $sec | ConvertTo-Json -Depth 80
-
-try {
-  Invoke-TSSRestMethod -request @{
-    Method="PUT"
-    Uri="/secrets/29671"
-    Body=$json
-    ContentType="application/json"
-  } | Out-Null
-  "PUT returned OK"
-} catch {
-  "STATUS: " + $_.Exception.Message
-  "BODY:"
-  Get-HttpErrorBody $_
-}
-
