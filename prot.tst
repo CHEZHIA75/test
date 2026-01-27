@@ -1,41 +1,30 @@
 <#
-sa-password-reset.ps1  (Sequential, PowerShell 5.1+ compatible)
+sa-password-reset.ps1  (Single-file deployable: diceware wordlist embedded as Base64, decoded in-memory)
 
-Rotate AD Service Account passwords using Secret Server Secret IDs.
+What this script does
+- Takes Secret Server Secret IDs (comma-separated)
+- For each SecretId:
+  - Reads secret from Secret Server (Get-Secret -full)
+  - Extracts:
+      Username  (top-level property)
+      Domain    (items fieldName: "Domain Name" OR "Domain")
+  - Only proceeds if Domain is one of the allowed domains (below). Otherwise SKIP.
+  - Generates a diceware password using an embedded Base64 wordlist (decoded to a map in-memory)
+  - Resets AD password (targets a discovered Domain Controller for that domain)
+  - Updates Secret Server password via winauthwebservices API:
+      PUT /secrets/{id} with the FULL secret object (only password itemValue changed)
+  - Verifies Secret Server password itemValue changed after update
 
-Your environment cmdlets (per your module listing):
-  - Connect-SecretServer
-  - Get-Secret        (Get-Secret [-id] <int> [-include-inactive] [-full])
-  - Invoke-TSSRestMethod (Invoke-TSSRestMethod [-request] <object>)
+Environment assumptions (based on your module codebase)
+- Connect-SecretServer -UseDefaultCredentials sets $env:TSSApiUrl to:
+    https://safe.myac.gov.au/SecretServer/winauthwebservices/api/v1
+- Invoke-TSSRestMethod expects request hashtable with Invoke-RestMethod-style keys, and it prepends $env:TSSApiUrl to request.Uri.
+- So request.Uri is RELATIVE like "/secrets/29671".
 
-IMPORTANT (based on your module codebase screenshots):
-- Connect-SecretServer sets:
-    $env:TSSApiUrl = $api_base_url + "/SecretServer/api/v1"
-    $env:TSSUseDefaultCredentials = 'true' (for Windows auth)
-- Invoke-TSSRestMethod prepends:
-    $request.Uri = $env:TSSApiUrl + $request.Uri
-  So request objects MUST use a RELATIVE Uri like "/secrets/29671" (NOT full URL, NOT "/api/v1/...").
-
-Policy:
-- Only rotate if secret domain item exists and is in allow-list:
-    nonprod.myac.gov.au
-    management.health.gov.au
-    myac.gov.au
-    central.health.gov.au
-- Domain item may be fieldName: "Domain Name" OR "Domain"
-- If domain missing or not allowed => SKIP (no AD reset, no TSS update)
-
-Flow per SecretId:
-1) Get secret (full)
-2) Extract Username (top-level property) and Domain (from items)
-3) Generate diceware password
-4) Reset AD password against discovered DC
-5) Update TSS password via Invoke-TSSRestMethod (PUT then POST fallback)
-   - Updates itemValue of the password item (fieldName "Password"/slug "password"/isPassword true)
-   - Verifies after update by re-fetching and checking password itemValue changed
-   - Builds a fresh request object each call (Invoke-TSSRestMethod mutates request by adding UseDefaultCredentials)
-
-No passwords are printed or logged.
+NOTE
+- No passwords are printed/logged.
+- Uses PowerShell 5.1 compatible syntax (no ??, no parallel).
+- You will paste the Base64 string into $EffWordlistBase64.
 #>
 
 [CmdletBinding()]
@@ -44,21 +33,25 @@ param(
     [ValidateNotNullOrEmpty()]
     [string]$SecretIds,
 
-    [switch]$DryRun,
-
-    [ValidateNotNullOrEmpty()]
-    [string]$WordListPath = ".\eff_wordlist"
+    [switch]$DryRun
 )
 
 $ErrorActionPreference = "Stop"
 
-# Only these domains are eligible for rotation.
+# ---- Allowed AD domains ----
 $AllowedDomains = @(
     "nonprod.myac.gov.au",
-    "Management.health.gov.au",
+    "management.health.gov.au",
     "myac.gov.au",
-    "central.health"
+    "central.health.gov.au"
 )
+
+# =============================================================================
+# Embedded eff_wordlist (Base64) - YOU will paste the Base64 string here
+# =============================================================================
+$EffWordlistBase64 = @"
+__PASTE_BASE64_HERE__
+"@
 
 function Write-Log {
     param(
@@ -77,25 +70,48 @@ function Parse-SecretIds {
 
     $ids = New-Object System.Collections.Generic.List[int]
     $seen = @{}
+
     foreach ($p in $parts) {
         if ($p -notmatch '^\d+$') { throw "Invalid SecretId '$p' (must be numeric)" }
         $i = [int]$p
-        if (-not $seen.ContainsKey($i)) { $seen[$i] = $true; $ids.Add($i) }
+        if (-not $seen.ContainsKey($i)) {
+            $seen[$i] = $true
+            $ids.Add($i)
+        }
     }
     return $ids
 }
 
-function Load-WordList {
-    param([string]$Path)
-    if (-not (Test-Path $Path)) { throw "Wordlist not found at '$Path'" }
+function Ensure-Environment {
+    try { Import-Module ActiveDirectory -ErrorAction Stop } catch { throw "ActiveDirectory module not available (RSAT required)." }
+    if (-not (Get-Command Connect-SecretServer -ErrorAction SilentlyContinue)) { throw "Missing cmdlet: Connect-SecretServer" }
+    if (-not (Get-Command Get-Secret -ErrorAction SilentlyContinue)) { throw "Missing cmdlet: Get-Secret" }
+    if (-not (Get-Command Invoke-TSSRestMethod -ErrorAction SilentlyContinue)) { throw "Missing cmdlet: Invoke-TSSRestMethod" }
+}
+
+function Get-DicewareWordMapFromBase64 {
+    if (-not $EffWordlistBase64 -or $EffWordlistBase64 -match '__PASTE_BASE64_HERE__') {
+        throw "Embedded eff_wordlist Base64 is missing. Paste your Base64 into `$EffWordlistBase64."
+    }
+
+    $bytes = [Convert]::FromBase64String(($EffWordlistBase64 -replace '\s',''))
+    $text  = [System.Text.Encoding]::UTF8.GetString($bytes)
 
     $map = @{}
-    Get-Content $Path | ForEach-Object {
-        $line = $_.Trim()
-        if (-not $line) { return }
-        $p = $line -split '\s+'
-        if ($p.Count -ge 2) { $map[$p[0]] = $p[1] }
+    foreach ($line in $text -split "`n") {
+        $line = $line.Trim()
+        if (-not $line) { continue }
+
+        $parts = $line -split '\s+'
+        if ($parts.Count -ge 2) {
+            $map[$parts[0]] = $parts[1]
+        }
     }
+
+    if ($map.Count -lt 1000) {
+        throw "Decoded diceware map unexpectedly small ($($map.Count) entries). Check embedded Base64."
+    }
+
     return $map
 }
 
@@ -106,32 +122,36 @@ function Roll-DiceKey {
 }
 
 function New-DicewarePassword {
-    param([hashtable]$WordMap, [int]$MinLength = 30)
+    param(
+        [Parameter(Mandatory)][hashtable]$WordMap,
+        [int]$MinLength = 30
+    )
 
     while ($true) {
         $words = @()
         for ($i = 0; $i -lt 4; $i++) {
             $key = Roll-DiceKey
             $word = $(if ($WordMap.ContainsKey($key)) { $WordMap[$key] } else { "UNKNOWN" })
-            $cap = $(if ($word.Length -gt 1) { $word.Substring(0,1).ToUpper() + $word.Substring(1).ToLower() } else { $word.ToUpper() })
+
+            if ($word.Length -gt 1) {
+                $cap = $word.Substring(0,1).ToUpper() + $word.Substring(1).ToLower()
+            } else {
+                $cap = $word.ToUpper()
+            }
             $words += $cap
         }
+
+        # trailing digit for typical complexity
         $digit = Get-Random -Minimum 0 -Maximum 10
         $words[$words.Count - 1] = $words[$words.Count - 1] + $digit
+
         $pw = ($words -join "-")
         if ($pw.Length -ge $MinLength) { return $pw }
     }
 }
 
-function Ensure-Environment {
-    try { Import-Module ActiveDirectory -ErrorAction Stop } catch { throw "ActiveDirectory module not available (RSAT required)." }
-    if (-not (Get-Command Connect-SecretServer -ErrorAction SilentlyContinue)) { throw "Missing cmdlet: Connect-SecretServer" }
-    if (-not (Get-Command Get-Secret -ErrorAction SilentlyContinue)) { throw "Missing cmdlet: Get-Secret" }
-    if (-not (Get-Command Invoke-TSSRestMethod -ErrorAction SilentlyContinue)) { throw "Missing cmdlet: Invoke-TSSRestMethod" }
-}
-
 function Get-TssSecretById {
-    param([int]$Id)
+    param([Parameter(Mandatory)][int]$Id)
     try { return Get-Secret -id $Id -full }
     catch { throw "Secret not found or inaccessible in TSS (SecretId=${Id}): $($_.Exception.Message)" }
 }
@@ -173,16 +193,17 @@ function Find-PasswordItem {
 }
 
 function Reset-ADPassword {
-    param([string]$Username, [string]$Domain, [string]$Password)
+    param(
+        [Parameter(Mandatory)][string]$Username,
+        [Parameter(Mandatory)][string]$Domain,
+        [Parameter(Mandatory)][string]$Password
+    )
 
     $dc = $null
-    try {
-        $dc = Get-ADDomainController -Discover -DomainName $Domain -ErrorAction Stop
-    } catch {
-        throw "Unable to discover a Domain Controller for domain '${Domain}'. $($_.Exception.Message)"
-    }
+    try { $dc = Get-ADDomainController -Discover -DomainName $Domain -ErrorAction Stop }
+    catch { throw "Unable to discover a Domain Controller for domain '${Domain}'. $($_.Exception.Message)" }
 
-    # In your environment HostName is a collection like {AV1WPRDADS02.myac.gov.au}
+    # In your env HostName is a collection like {AV1WPRDADS02.myac.gov.au}
     $serverObj = $dc.HostName
     if (-not $serverObj) { $serverObj = $dc.Name }
     if (-not $serverObj) { throw "DC discovery returned no HostName/Name for domain '${Domain}'." }
@@ -214,18 +235,19 @@ function Update-TssPassword {
     $pwItem = Find-PasswordItem -Secret $sec
     if (-not $pwItem) { throw "SecretId=${SecretId}: could not locate password item." }
 
+    # Old value for verification (do not print)
     $oldValue = $pwItem.itemValue
 
-    # Update only the password value (do not log it)
+    # Update only the password itemValue
     $pwItem.itemValue = $NewPassword
 
-    # These often cause validation problems when echoing a GET object back into PUT
+    # Some responses include responseCodes which can break PUT validation.
     if ($sec.PSObject.Properties.Name -contains "responseCodes") { $sec.responseCodes = $null }
 
-    # Convert the FULL secret object to JSON
+    # PUT expects the FULL secret object (your test proved this works)
     $json = $sec | ConvertTo-Json -Depth 80
 
-    # Fresh request object (Invoke-TSSRestMethod mutates the hashtable)
+    # Fresh request object (Invoke-TSSRestMethod mutates hashtable)
     $req = @{
         Method      = "PUT"
         Uri         = "/secrets/$SecretId"
@@ -235,12 +257,11 @@ function Update-TssPassword {
 
     try {
         Invoke-TSSRestMethod -request $req | Out-Null
-    }
-    catch {
+    } catch {
         throw "SecretId=${SecretId}: TSS PUT update failed. $($_.Exception.Message)"
     }
 
-    # Verify it actually changed
+    # Verify changed
     Start-Sleep -Seconds 1
     $sec2 = Get-Secret -id $SecretId -full
     $pw2 = Find-PasswordItem -Secret $sec2
@@ -251,20 +272,22 @@ function Update-TssPassword {
     }
 }
 
-
 # ---------------- MAIN ----------------
 Write-Log "Starting service account password rotation (DryRun=$DryRun)" "INFO"
 Ensure-Environment
 
+# Decode embedded wordlist ONCE into a map (memory only)
+$wordMap = Get-DicewareWordMapFromBase64
+
 $ids = Parse-SecretIds $SecretIds
-$wordMap = Load-WordList $WordListPath
 
 Write-Log "Connecting to Secret Server..." "INFO"
 Connect-SecretServer -UseDefaultCredentials | Out-Null
 
-# Optional quick sanity: ensure module env vars exist after connect
 if (-not $env:TSSApiUrl) {
     Write-Log "WARNING: env:TSSApiUrl not set after Connect-SecretServer; REST updates may fail." "WARN"
+} else {
+    Write-Log ("TSSApiUrl: {0}" -f $env:TSSApiUrl) "DEBUG"
 }
 
 $failures = 0
@@ -273,13 +296,13 @@ foreach ($sid in $ids) {
     try {
         $secret = Get-TssSecretById -Id $sid
 
-        # Username is a top-level property in your module output
+        # Username is top-level property in your module output
         if (-not ($secret.PSObject.Properties.Name -contains 'Username') -or -not $secret.Username) {
             throw "SecretId=${sid}: missing Username."
         }
         $username = [string]$secret.Username
 
-        # Domain can be either "Domain Name" or "Domain"
+        # Domain may be "Domain Name" or "Domain" (items-based)
         $domainName = Get-ItemValueByAnyFieldName -Secret $secret -FieldNames @("Domain Name","Domain")
         if ($domainName) { $domainName = ([string]$domainName).ToLower() }
 
