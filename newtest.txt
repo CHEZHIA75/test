@@ -1,5 +1,8 @@
 -Dcom.sun.management.jmxremote -Dcom.sun.management.jmxremote.port=7199 -Dcom.sun.management.jmxremote.rmi.port=7199 -Dcom.sun.management.jmxremote.local.only=true -Dcom.sun.management.jmxremote.authenticate=false -Dcom.sun.management.jmxremote.ssl=false
 
-wget https://repo1.maven.org/maven2/io/prometheus/jmx/jmx_prometheus_standalone/1.5.0/jmx_prometheus_standalone-1.5.0.jar
+hostPort: "localhost:7199"
+lowercaseOutputName: true
+lowercaseOutputLabelNames: true
 
-https://repo1.maven.org/maven2/io/prometheus/jmx/jmx_prometheus_standalone/1.5.0/jmx_prometheus_standalone-1.5.0.jar
+rules:
+  - pattern: '.*'
