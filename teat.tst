@@ -2,10 +2,10 @@
 
 set -u
 
-COMMAND='${option.command}'
-TARGETS='${option.targets}'
-AUTOMATION_PASS='${option.automation_pass}'
-DRYRUN='${option.dryrun}'
+COMMAND='@option.command@'
+TARGETS='@option.targets@'
+AUTOMATION_PASS='@option.automation_pass@'
+DRYRUN='@option.dryrun@'
 
 success_count=0
 failure_count=0
@@ -90,13 +90,13 @@ get_exec_command() {
     windows)
       case "$cmd" in
         ping|getcrl)
-          printf '%s' 'C:\Program Files\VERITAS\NetBackup\bin\nbcertcmd -'"${cmd}"
+          printf '%s' "& \"C:\\Program Files\\VERITAS\\NetBackup\\bin\\nbcertcmd\" -${cmd}"
           ;;
         getCACertificate)
-          printf '%s' 'C:\Program Files\VERITAS\NetBackup\bin\nbcertcmd -'"${cmd} -server ${nb_master}"
+          printf '%s' "& \"C:\\Program Files\\VERITAS\\NetBackup\\bin\\nbcertcmd\" -${cmd} -server ${nb_master}"
           ;;
         clear_host_cache|pn|"pn -verbose")
-          printf '%s' 'C:\Program Files\VERITAS\NetBackup\bin\bpclntcmd -'"${cmd}"
+          printf '%s' "& \"C:\\Program Files\\VERITAS\\NetBackup\\bin\\bpclntcmd\" -${cmd}"
           ;;
         *)
           return 1
