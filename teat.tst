@@ -90,13 +90,13 @@ get_exec_command() {
     windows)
       case "$cmd" in
         ping|getcrl)
-          printf '%s' "& \"C:\\Program Files\\VERITAS\\NetBackup\\bin\\nbcertcmd\" -${cmd}"
+          printf '%s' "& \"C:\\Program Files\\VERITAS\\NetBackup\\bin\\nbcertcmd\" -${cmd} 2>&1; exit \$LASTEXITCODE"
           ;;
         getCACertificate)
-          printf '%s' "& \"C:\\Program Files\\VERITAS\\NetBackup\\bin\\nbcertcmd\" -${cmd} -server ${nb_master}"
+          printf '%s' "& \"C:\\Program Files\\VERITAS\\NetBackup\\bin\\nbcertcmd\" -${cmd} -server ${nb_master} 2>&1; exit \$LASTEXITCODE"
           ;;
         clear_host_cache|pn|"pn -verbose")
-          printf '%s' "& \"C:\\Program Files\\VERITAS\\NetBackup\\bin\\bpclntcmd\" -${cmd}"
+          printf '%s' "& \"C:\\Program Files\\VERITAS\\NetBackup\\bin\\bpclntcmd\" -${cmd} 2>&1; exit \$LASTEXITCODE"
           ;;
         *)
           return 1
