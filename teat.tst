@@ -234,3 +234,26 @@ echo "Succeeded      : $success_count"
 echo "Failed         : $failure_count"
 echo "Skipped        : $skipped_count"
 echo "============================="
+
+
+if [[ "$os_type" == "linux" ]]; then
+  output="$(
+    bolt command run "$remote_cmd" \
+      --no-host-key-check \
+      -u sa_automation_prod \
+      -p "$AUTOMATION_PASS" \
+      --run-as root \
+      -t "$target" 2>&1
+  )"
+else
+  output="$(
+    bolt command run "$remote_cmd" \
+      --no-host-key-check \
+      -u sa_automation_prod \
+      -p "$AUTOMATION_PASS" \
+      -t "$target" 2>&1
+  )"
+fi
+
+rc=$?
+echo "$output
