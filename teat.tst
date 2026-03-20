@@ -21,8 +21,12 @@ trim() {
 
 is_true() {
   case "$1" in
-    true|TRUE|True|yes|YES|Yes|1) return 0 ;;
-    *) return 1 ;;
+    true|TRUE|True|yes|YES|Yes|1)
+      return 0
+      ;;
+    *)
+      return 1
+      ;;
   esac
 }
 
@@ -50,7 +54,7 @@ get_nb_master() {
 
   case "$target" in
     *dev*)
-      echo "mv2wdevnbu01.management.health.gov.au"
+      echo "mv2wprdnbu01.management.health.gov.au"
       ;;
     *prd*)
       echo "mv2wprdnbu01.management.health.gov.au"
@@ -86,13 +90,19 @@ get_exec_command() {
     windows)
       case "$cmd" in
         ping|getcrl)
-          printf '%s' "cmd.exe /c \"\"C:\\Program Files\\VERITAS\\NetBackup\\bin\\nbcertcmd.exe\" -${cmd}\""
+          printf '%s' "powershell -NoProfile -Command \"\$p = & 'C:\\Program Files\\VERITAS\\NetBackup\\bin\\nbcertcmd.exe' -${cmd} 2>&1; \$p | ForEach-Object { \$_.ToString() }; exit \$LASTEXITCODE\""
           ;;
         getCACertificate)
-          printf '%s' "cmd.exe /c \"\"C:\\Program Files\\VERITAS\\NetBackup\\bin\\nbcertcmd.exe\" -${cmd} -server ${nb_master}\""
+          printf '%s' "powershell -NoProfile -Command \"\$p = & 'C:\\Program Files\\VERITAS\\NetBackup\\bin\\nbcertcmd.exe' -${cmd} -server ${nb_master} 2>&1; \$p | ForEach-Object { \$_.ToString() }; exit \$LASTEXITCODE\""
           ;;
-        clear_host_cache|pn|"pn -verbose")
-          printf '%s' "cmd.exe /c \"\"C:\\Program Files\\VERITAS\\NetBackup\\bin\\bpclntcmd.exe\" -${cmd}\""
+        clear_host_cache)
+          printf '%s' "powershell -NoProfile -Command \"\$p = & 'C:\\Program Files\\VERITAS\\NetBackup\\bin\\bpclntcmd.exe' -clear_host_cache 2>&1; \$p | ForEach-Object { \$_.ToString() }; exit \$LASTEXITCODE\""
+          ;;
+        pn)
+          printf '%s' "powershell -NoProfile -Command \"\$p = & 'C:\\Program Files\\VERITAS\\NetBackup\\bin\\bpclntcmd.exe' -pn 2>&1; \$p | ForEach-Object { \$_.ToString() }; \$out = (\$p | Out-String); if (\$out -match 'expecting response from server' -or \$out -match '[A-Za-z0-9._-]+\\s+[A-Za-z0-9._-]+\\s+[0-9]{1,3}(\\.[0-9]{1,3}){3}') { exit 0 } else { exit \$LASTEXITCODE }\""
+          ;;
+        "pn -verbose")
+          printf '%s' "powershell -NoProfile -Command \"\$p = & 'C:\\Program Files\\VERITAS\\NetBackup\\bin\\bpclntcmd.exe' -pn -verbose 2>&1; \$p | ForEach-Object { \$_.ToString() }; \$out = (\$p | Out-String); if (\$out -match 'expecting response from server' -or \$out -match '[A-Za-z0-9._-]+\\s+[A-Za-z0-9._-]+\\s+[0-9]{1,3}(\\.[0-9]{1,3}){3}') { exit 0 } else { exit \$LASTEXITCODE }\""
           ;;
         *)
           return 1
@@ -154,13 +164,17 @@ for raw_target in "${target_array[@]}"; do
 
   executed_count=$((executed_count + 1))
 
-  bolt command run "$exec_cmd" \
-    --no-host-key-check \
-    -u sa_automation_prod \
-    -p "$AUTOMATION_PASS" \
-    -t "$target"
-
+  output="$(
+    bolt command run "$exec_cmd" \
+      --no-host-key-check \
+      -u sa_automation_prod \
+      -p "$AUTOMATION_PASS" \
+      -t "$target" 2>&1
+  )"
   rc=$?
+
+  echo "$output"
+
   if [[ $rc -eq 0 ]]; then
     echo "Status   : SUCCESS"
     success_count=$((success_count + 1))
