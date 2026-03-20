@@ -207,3 +207,25 @@ echo "Succeeded      : $success_count"
 echo "Failed         : $failure_count"
 echo "Skipped        : $skipped_count"
 echo "============================="
+
+ps='
+$exe = "C:\Program Files\VERITAS\NetBackup\bin\bpclntcmd.exe"
+$args = "-pn"
+$out = [System.IO.Path]::GetTempFileName()
+$err = [System.IO.Path]::GetTempFileName()
+$p = Start-Process -FilePath $exe -ArgumentList $args -RedirectStandardOutput $out -RedirectStandardError $err -Wait -PassThru
+if (Test-Path $out) { Get-Content $out }
+if (Test-Path $err) { Get-Content $err }
+exit $p.ExitCode
+'
+enc=$(printf '%s' "$ps" | iconv -f UTF-8 -t UTF-16LE | base64 -w 0)
+
+bolt command run "powershell -NoProfile -EncodedCommand $enc" \
+  --targets av3wdevsql20.myac.gov.au \
+  --user duraii-a \
+  --password-prompt \
+  --run-as Administrator \
+  --no-host-key-check \
+  --format human \
+  --no-ssl \
+  --connect-timeout 30
