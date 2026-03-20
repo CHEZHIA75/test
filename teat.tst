@@ -21,12 +21,8 @@ trim() {
 
 is_true() {
   case "$1" in
-    true|TRUE|True|yes|YES|Yes|1)
-      return 0
-      ;;
-    *)
-      return 1
-      ;;
+    true|TRUE|True|yes|YES|Yes|1) return 0 ;;
+    *) return 1 ;;
   esac
 }
 
@@ -90,13 +86,13 @@ get_exec_command() {
     windows)
       case "$cmd" in
         ping|getcrl)
-          printf '%s' "& \"C:\\Program Files\\VERITAS\\NetBackup\\bin\\nbcertcmd\" -${cmd} 2>&1; exit \$LASTEXITCODE"
+          printf '%s' "cmd.exe /c \"\"C:\\Program Files\\VERITAS\\NetBackup\\bin\\nbcertcmd.exe\" -${cmd}\""
           ;;
         getCACertificate)
-          printf '%s' "& \"C:\\Program Files\\VERITAS\\NetBackup\\bin\\nbcertcmd\" -${cmd} -server ${nb_master} 2>&1; exit \$LASTEXITCODE"
+          printf '%s' "cmd.exe /c \"\"C:\\Program Files\\VERITAS\\NetBackup\\bin\\nbcertcmd.exe\" -${cmd} -server ${nb_master}\""
           ;;
         clear_host_cache|pn|"pn -verbose")
-          printf '%s' "& \"C:\\Program Files\\VERITAS\\NetBackup\\bin\\bpclntcmd\" -${cmd} 2>&1; exit \$LASTEXITCODE"
+          printf '%s' "cmd.exe /c \"\"C:\\Program Files\\VERITAS\\NetBackup\\bin\\bpclntcmd.exe\" -${cmd}\""
           ;;
         *)
           return 1
