@@ -1,0 +1,136 @@
+class oap_server::javastore () {
+  assert_private()
+
+  # ENC provided vars (node/paas_info) are set at top scope
+  #lint:ignore:top_scope_facts
+  $node_certificate = $::node_info.dig('components', 'certificates', 'oap')
+  $keystore_acc_id  = $::paas_info.dig('components', 'account', 'keystore', 'secret_id')
+  #lint:endignore
+
+  if ($node_certificate and $keystore_acc_id) {
+    $keystore_acc = lookup("secret_server::${keystore_acc_id}")
+
+    $root_ca_secret   = lookup("secret_server::${oap_server::root_ca_secret_id}")
+    $inter_ca_secret  = lookup("secret_server::${oap_server::inter_ca_secret_id}")
+    $node_cert_secret = lookup("secret_server::${node_certificate['secret_id']}")
+
+    $root_ca_pem   = $root_ca_secret.unwrap()['Certificate (PEM Encoded)']
+    $inter_ca_pem  = $inter_ca_secret.unwrap()['Certificate (PEM Encoded)']
+    $node_cert_pem = $node_cert_secret.unwrap()['Certificate (PEM Encoded)']
+    $node_cert_key = $node_cert_secret.unwrap()['Private Key (PEM Encoded)']
+
+    file { '/etc/pki/tls/oap_server':
+      ensure => directory,
+      owner  => 'root',
+      group  => 'root',
+      mode   => '0755',
+    }
+
+    file { '/etc/pki/tls/certs/myac_root.pem':
+      ensure  => file,
+      owner   => 'root',
+      group   => 'root',
+      mode    => '0644',
+      content => $root_ca_pem,
+    }
+
+    file { '/etc/pki/tls/certs/myac_int.pem':
+      ensure  => file,
+      owner   => 'root',
+      group   => 'root',
+      mode    => '0644',
+      content => $inter_ca_pem,
+    }
+
+    file { '/etc/pki/tls/oap_server/oap_server.cer':
+      ensure  => file,
+      owner   => 'root',
+      group   => 'root',
+      mode    => '0644',
+      content => $node_cert_pem,
+      require => File['/etc/pki/tls/oap_server'],
+    }
+
+    file { '/etc/pki/tls/oap_server/oap_server.key':
+      ensure  => file,
+      owner   => 'root',
+      group   => 'root',
+      mode    => '0600',
+      content => $node_cert_key,
+      require => File['/etc/pki/tls/oap_server'],
+    }
+
+    file { '/u01/oap_server.jks':
+      ensure  => file,
+      owner   => 'oracle',
+      group   => 'oinstall',
+      replace => false,
+      mode    => '0600',
+    }
+
+    dc_java_ks { 'myacroot':
+      ensure       => latest,
+      certificate  => '/etc/pki/tls/certs/myac_root.pem',
+      target       => '/u01/oap_server.jks',
+      password     => $keystore_acc.unwrap()['Password'],
+      trustcacerts => true,
+      keytool_path => '/u01/jdk/bin/keytool',
+      require      => [
+        File['/u01/oap_server.jks'],
+        File['/etc/pki/tls/certs/myac_root.pem'],
+      ],
+    }
+
+    dc_java_ks { 'myacint':
+      ensure       => latest,
+      certificate  => '/etc/pki/tls/certs/myac_int.pem',
+      target       => '/u01/oap_server.jks',
+      password     => $keystore_acc.unwrap()['Password'],
+      trustcacerts => true,
+      keytool_path => '/u01/jdk/bin/keytool',
+      require      => [
+        File['/u01/oap_server.jks'],
+        File['/etc/pki/tls/certs/myac_int.pem'],
+      ],
+    }
+
+    dc_java_ks { 'oap_server':
+      ensure       => latest,
+      certificate  => '/etc/pki/tls/oap_server/oap_server.cer',
+      private_key  => '/etc/pki/tls/oap_server/oap_server.key',
+      target       => '/u01/oap_server.jks',
+      password     => $keystore_acc.unwrap()['Password'],
+      keytool_path => '/u01/jdk/bin/keytool',
+      require      => [
+        File['/u01/oap_server.jks'],
+        File['/etc/pki/tls/oap_server/oap_server.cer'],
+        File['/etc/pki/tls/oap_server/oap_server.key'],
+      ],
+    }
+
+    if ($oap_server::inject_default_keystores) {
+      dc_java_ks { 'myacroot_java':
+        ensure       => latest,
+        certificate  => '/etc/pki/tls/certs/myac_root.pem',
+        target       => '/u01/app/oracle/product/jdk/jre/lib/security/cacerts',
+        password     => 'changeit',
+        trustcacerts => true,
+        keytool_path => '/u01/app/oracle/product/jdk/bin/keytool',
+        require      => File['/etc/pki/tls/certs/myac_root.pem'],
+      }
+
+      dc_java_ks { 'myacint_java':
+        ensure       => latest,
+        certificate  => '/etc/pki/tls/certs/myac_int.pem',
+        target       => '/u01/app/oracle/product/jdk/jre/lib/security/cacerts',
+        password     => 'changeit',
+        trustcacerts => true,
+        keytool_path => '/u01/app/oracle/product/jdk/bin/keytool',
+        require      => File['/etc/pki/tls/certs/myac_int.pem'],
+      }
+    }
+
+  } else {
+    notify { 'node_certificate or keystore_acc_id are not present': }
+  }
+}
