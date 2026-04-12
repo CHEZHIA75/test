@@ -1,0 +1,337 @@
+variables:
+  CONTAINER_IMAGE                : containers.binrepo.management.health.gov.au/tofu:stable
+  TF_CLI_CONFIG_FILE             : ./.cli_config.tfrc
+  TF_HTTP_USERNAME               : gitlab-ci-token
+  TF_HTTP_PASSWORD               : $CI_JOB_TOKEN
+  TF_VAR_http_backend_project_id : $CI_PROJECT_ID
+  TF_VAR_http_backend_state_file : ${PAAS_ID}
+  TF_VAR_etcd_username           : $ETCD_USER
+  TF_VAR_etcd_password           : $ETCD_PASSWORD
+  TF_VAR_infoblox_username       : $INFOBLOX_USER
+  TF_VAR_infoblox_password       : $INFOBLOX_PASSWORD
+  TF_VAR_tss_username            : $TSS_USER
+  TF_VAR_tss_password            : $TSS_PASSWORD
+  TF_VAR_gitlab_token            : $GITLAB_TOKEN
+  TF_VAR_gitlab_pipeline_id      : $CI_PIPELINE_ID
+  TF_VAR_myac_ad_username        : $MYAC_AD_USER
+  TF_VAR_myac_ad_password        : $MYAC_AD_PASSWORD
+  TF_VAR_nonprod_ad_username     : $NONPROD_AD_USER
+  TF_VAR_nonprod_ad_password     : $NONPROD_AD_PASSWORD
+  TF_VAR_vsphere_username        : $VSPHERE_USER
+  TF_VAR_vsphere_password        : $VSPHERE_PASSWORD
+  TF_VAR_f5_username             : $F5_USERNAME
+  TF_VAR_f5_password             : $F5_PASSWORD
+  TF_VAR_created_by              : $GITLAB_USER_LOGIN
+  TF_ROOT                        : ${CI_PROJECT_DIR}
+  TF_REGISTRY_CLIENT_TIMEOUT     : 120  # Fix weirdness with slow registry for module
+  COMPONENT_PROJECT_ID           : 1091
+  PAAS_ID:
+    description: "The PaaS ID you intend to deploy"
+  ACTION:
+    description: "What action to perform"
+    value: provision
+    options:
+      - provision
+      - teardown
+
+workflow:
+  name: "[$ACTION] - ${PAAS_ID}"
+
+stages:
+  - env-vars
+  - init
+  - prereqs
+  - build
+  - pre-deploy
+  - deploy
+  - post-deploy
+  - components
+  - pre-teardown
+  - teardown-plan
+  - teardown
+  - post-teardown
+
+generate-env-vars:
+  stage: env-vars
+  script:
+    - PAAS_SEGMENTS=(${PAAS_ID//./ })
+    - export PAAS_PROJECT=${PAAS_SEGMENTS[0]} && echo "PAAS_PROJECT=${PAAS_PROJECT}" >> deploy.env
+    - export PAAS_RELEASE=${PAAS_SEGMENTS[1]} && echo "PAAS_RELEASE=${PAAS_RELEASE}" >> deploy.env
+    - export PAAS_ENVIRONMENT=${PAAS_SEGMENTS[2]} && echo "PAAS_ENVIRONMENT=${PAAS_ENVIRONMENT}" >> deploy.env
+    - |
+      if [[ ${#PAAS_SEGMENTS[@]} -eq 5 ]]; then
+        export PAAS_APPLICATION="${PAAS_SEGMENTS[3]}.${PAAS_SEGMENTS[4]}" && echo "PAAS_APPLICATION=${PAAS_APPLICATION}" >> deploy.env
+      else
+        export PAAS_APPLICATION=${PAAS_SEGMENTS[3]} && echo "PAAS_APPLICATION=${PAAS_APPLICATION}" >> deploy.env
+      fi
+  artifacts:
+    reports:
+      dotenv: deploy.env
+  image:
+    name: $CONTAINER_NAME
+    entrypoint: ["/bin/bash", "-c"]
+  tags:
+    - cihost
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+      when: never
+    - if: $CI_PIPELINE_SOURCE == "web"
+      when: always
+    - when: never
+
+init:
+  stage: init
+  cache:
+    - key: "tofu-paas-default"
+      paths:
+        - .terraform/modules
+        - .terraform/providers
+        - .terraform.lock.hcl
+    - key: "tofu-state-${PAAS_ID}"
+      paths:
+        - .terraform/terraform.tfstate
+        - ./*.tf
+        - ./*.tfvars
+        - ./*.tcl
+  script:
+    - tofu --version
+    - cp ./paas_id/${PAAS_ID}.tfvars ./
+    - cp ./paas_environment/${PAAS_ENVIRONMENT}.tfvars ./
+    - find ./paas_application/${PAAS_APPLICATION} -type f -exec cp {} . \;
+    - tofu init -reconfigure -upgrade -input=false
+    - chmod a+x .terraform/providers/registry.opentofu.org/agileito/etcdv2/*/linux_amd64/terraform-provider-etcdv2
+    - chmod a+x .terraform/providers/registry.opentofu.org/agileito/tss/*/linux_amd64/terraform-provider-tss
+  image:
+    name: $CONTAINER_IMAGE
+    entrypoint: ["/bin/bash", "-c"]
+  tags:
+    - cihost
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+      when: never
+    - if: $CI_PIPELINE_SOURCE == "web"
+      when: on_success
+    - when: never
+
+paas-custom-naming:
+  stage: prereqs
+  image:
+    name: containers.binrepo.management.health.gov.au/pwsh-core:latest
+    entrypoint: [""]
+  script:
+    - pwsh -Command "./.gitlab-ci/paas-custom-naming.ps1 -paas_id ${PAAS_ID} -tfvars_file './paas_id/${PAAS_ID}.tfvars'"
+    - exit $EXIT_CODE
+  tags:
+    - cihost
+  artifacts:
+    paths:
+      - ./vm_names.tfvars.json
+    reports:
+      dotenv: vm_names.env
+    expire_in: never
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+      when: never
+    - if: $CI_PIPELINE_SOURCE == "web"
+      when: on_success
+    - when: never
+
+plan:
+  stage: build
+  script: 
+    - ls -lah
+    - chmod a+x .terraform/providers/registry.opentofu.org/agileito/etcdv2/*/linux_amd64/terraform-provider-etcdv2
+    - tofu plan -out ./${PAAS_ID}_plan -var-file "./dept.tfvars" -var-file "./${PAAS_ENVIRONMENT}.tfvars" -var-file "./${PAAS_APPLICATION}.tfvars" -var-file "./${PAAS_ID}.tfvars" -var-file ./vm_names.tfvars.json
+  image:
+    name: $CONTAINER_IMAGE
+    entrypoint: ["/bin/bash", "-c"]
+  artifacts:
+    paths:
+      - ./${PAAS_ID}_plan
+    expire_in: never
+  cache:
+    - key: "tofu-paas-default"
+      paths:
+        - .terraform/modules
+        - .terraform/providers
+        - .terraform.lock.hcl
+    - key: "tofu-state-${PAAS_ID}"
+      paths:
+        - .terraform/terraform.tfstate
+        - ./*.tf
+        - ./*.tfvars
+        - ./*.tcl
+  tags:
+    - cihost
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+      when: never
+    - if: $CI_PIPELINE_SOURCE == "web" && $ACTION == "provision"
+      when: on_success
+    - when: never
+
+apply:
+  stage: deploy
+  cache:
+    - key: "tofu-paas-default"
+      paths:
+        - .terraform/modules
+        - .terraform/providers
+        - .terraform.lock.hcl
+    - key: "tofu-state-${PAAS_ID}"
+      paths:
+        - .terraform/terraform.tfstate
+        - ./*.tf
+        - ./*.tfvars
+        - ./*.tcl
+  script:
+    - ls -lah
+    - tofu apply -auto-approve -backup ./tofu_prev_state.tfstate.backup ./${PAAS_ID}_plan
+  image:
+    name: $CONTAINER_IMAGE
+    entrypoint: ["/bin/bash", "-c"]
+  tags:
+    - cihost
+  allow_failure: true
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+      when: never
+    - if: $CI_PIPELINE_SOURCE == "web" && $ACTION == "provision"
+      when: manual
+    - when: never
+
+component-provisioning:
+  stage: components
+  script:
+    - |
+      for name in $VM_NAMES_LIST; do
+          curl --request POST --form "token=$CI_JOB_TOKEN" --form "ref=main" --form "variables[FQDN]=${name,,}.myac.gov.au" "https://git.management.health.gov.au/api/v4/projects/${COMPONENT_PROJECT_ID}/trigger/pipeline"
+      done
+  image:
+    name: $CONTAINER_NAME
+    entrypoint: ["/bin/bash", "-c"]
+  tags:
+    - cihost
+  rules:
+    - if: '$ci_pipeline_source == "merge_request_event"'
+      when: never
+    - if: $ci_pipeline_source == "web" && $action == "provision"
+      when: manual
+    - when: never
+
+# Can be removed if we fork the AD provider (sigh...) and add ephemeral pw support
+component-account-ad-update:
+  stage: post-deploy
+  script:
+    - pwsh -Command "./.gitlab-ci/update-component-account-as-passwords.ps1 ${PAAS_ID}"
+    - exit $EXIT_CODE
+  tags:
+    - powershell_myac
+  rules:
+    - if: '$ci_pipeline_source == "merge_request_event"'
+      when: never
+    - if: $ci_pipeline_source == "web" && $action == "provision"
+      when: manual
+    - when: never
+
+
+component-teardown:
+  stage: pre-teardown
+  script:
+    - |
+      for name in $VM_NAMES_LIST; do
+          curl --request POST --form "token=$CI_JOB_TOKEN" --form "ref=main" --form "variables[ACTION]=teardown" --form "variables[FQDN]=${name,,}.myac.gov.au" "https://git.management.health.gov.au/api/v4/projects/${COMPONENT_PROJECT_ID}/trigger/pipeline"
+      done
+  image:
+    name: $CONTAINER_NAME
+    entrypoint: ["/bin/bash", "-c"]
+  tags:
+    - cihost
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+      when: never
+    - if: $CI_PIPELINE_SOURCE == "web" && $ACTION == "teardown"
+      when: manual
+    - when: never
+
+destroy-plan:
+  stage: teardown-plan
+  cache:
+    - key: "tofu-paas-default"
+      paths:
+        - .terraform/modules
+        - .terraform/providers
+        - .terraform.lock.hcl
+    - key: "tofu-state-${PAAS_ID}"
+      paths:
+        - .terraform/terraform.tfstate
+        - ./*.tf
+        - ./*.tfvars
+        - ./*.tcl
+  script:
+    - ls -lah
+    - chmod a+x .terraform/providers/registry.opentofu.org/agileito/etcdv2/*/linux_amd64/terraform-provider-etcdv2
+    - tofu plan -destroy -out ./${PAAS_ID}_destroy_plan -var-file "./dept.tfvars" -var-file "./${PAAS_ENVIRONMENT}.tfvars" -var-file "./${PAAS_APPLICATION}.tfvars" -var-file "./${PAAS_ID}.tfvars" -var-file ./vm_names.tfvars.json
+  image:
+    name: $CONTAINER_IMAGE
+    entrypoint: ["/bin/bash", "-c"]
+  artifacts:
+    paths:
+      - ./${PAAS_ID}_destroy_plan
+  tags:
+    - cihost
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+      when: never
+    - if: $CI_PIPELINE_SOURCE == "web" && $ACTION == "teardown"
+      when: manual
+    - when: never
+
+
+destroy:
+  stage: teardown
+  cache:
+    - key: "tofu-paas-default"
+      paths:
+        - .terraform/modules
+        - .terraform/providers
+        - .terraform.lock.hcl
+    - key: "tofu-state-${PAAS_ID}"
+      paths:
+        - .terraform/terraform.tfstate
+        - ./*.tf
+        - ./*.tfvars
+        - ./*.tcl
+  script:
+    - ls -lah
+    - tofu apply -destroy -auto-approve ./${PAAS_ID}_destroy_plan
+  image:
+    name: $CONTAINER_IMAGE
+    entrypoint: ["/bin/bash", "-c"]
+  tags:
+    - cihost
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+      when: never
+    - if: $CI_PIPELINE_SOURCE == "web" && $ACTION == "teardown"
+      when: manual
+    - when: never
+
+cleanup-kvs-keys:
+  stage: post-teardown
+  image:
+    name: containers.binrepo.management.health.gov.au/pwsh-core:latest
+    entrypoint: [""]
+  script:
+    - pwsh -Command "./.gitlab-ci/cleanup-paas-keys.ps1 ${PAAS_ID}"
+    - exit $EXIT_CODE
+  tags:
+    - cihost
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+      when: never
+    - if: $PAAS_ID == ""
+      when: never
+    - if: $CI_PIPELINE_SOURCE == "web" && $ACTION == "teardown"
+      when: manual
+    - when: never
